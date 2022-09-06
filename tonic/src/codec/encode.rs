@@ -86,6 +86,29 @@ where
     })
 }
 
+pub(crate) fn encode_unary_client<T>(
+    mut encoder: T,
+    item: T::Item,
+    compression_encoding: Option<CompressionEncoding>,
+) -> Result<Bytes, Status>
+where
+    T: Encoder<Error = Status>,
+{
+    let mut buf = BytesMut::new();
+    let mut uncompression_buf = if compression_encoding.is_some() {
+        BytesMut::with_capacity(BUFFER_SIZE)
+    } else {
+        BytesMut::new()
+    };
+    encode_item(
+        &mut encoder,
+        &mut buf,
+        &mut uncompression_buf,
+        compression_encoding,
+        item,
+    )
+}
+
 fn encode_item<T>(
     encoder: &mut T,
     buf: &mut BytesMut,

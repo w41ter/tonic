@@ -2,7 +2,7 @@ use crate::codec::compression::{CompressionEncoding, EnabledCompressionEncodings
 use crate::{
     body::BoxBody,
     client::GrpcService,
-    codec::{encode_client, Codec, Decoder, Streaming},
+    codec::{encode_client, encode_unary_client, Codec, Decoder, Streaming},
     request::SanitizeHeaders,
     Code, Request, Response, Status,
 };
@@ -137,22 +137,85 @@ impl<T> Grpc<T> {
     }
 
     /// Send a single unary gRPC request.
-    pub async fn unary<M1, M2, C>(
-        &mut self,
+    pub fn unary<'a, M1, M2, C>(
+        &'a mut self,
         request: Request<M1>,
         path: PathAndQuery,
-        codec: C,
-    ) -> Result<Response<M2>, Status>
+        mut codec: C,
+    ) -> impl std::future::Future<Output = Result<Response<M2>, Status>> + 'a
     where
         T: GrpcService<BoxBody>,
         T::ResponseBody: Body + Send + 'static,
         <T::ResponseBody as Body>::Error: Into<crate::Error>,
-        C: Codec<Encode = M1, Decode = M2>,
+        C: Codec<Encode = M1, Decode = M2> + 'a,
         M1: Send + Sync + 'static,
         M2: Send + Sync + 'static,
     {
-        let request = request.map(|m| stream::once(future::ready(m)));
-        self.client_streaming(request, path, codec).await
+        let request = request
+            .map(|s| {
+                encode_unary_client(codec.encoder(), s, self.config.send_compression_encodings)
+            })
+            .map(bytes_body::BytesBody::new)
+            .map(BoxBody::new);
+        let request = self.config.prepare_request(request, path);
+
+        async move {
+            let response = self
+                .inner
+                .call(request)
+                .await
+                .map_err(Status::from_error_generic)?;
+
+            let decoder = codec.decoder();
+
+            let encoding = CompressionEncoding::from_encoding_header(
+                response.headers(),
+                self.config.accept_compression_encodings,
+            )?;
+
+            let status_code = response.status();
+            let trailers_only_status = Status::from_header_map(response.headers());
+
+            // We do not need to check for trailers if the `grpc-status` header is present
+            // with a valid code.
+            let expect_additional_trailers = if let Some(status) = trailers_only_status {
+                if status.code() != Code::Ok {
+                    return Err(status);
+                }
+
+                false
+            } else {
+                true
+            };
+
+            let response = response.map(|body| {
+                if expect_additional_trailers {
+                    Streaming::new_response(decoder, body, status_code, encoding)
+                } else {
+                    Streaming::new_empty(decoder, body)
+                }
+            });
+
+            let response = Response::from_http(response);
+            let (mut parts, body, extensions) = response.into_parts();
+
+            futures_util::pin_mut!(body);
+
+            let message = body
+                .try_next()
+                .await
+                .map_err(|mut status| {
+                    status.metadata_mut().merge(parts.clone());
+                    status
+                })?
+                .ok_or_else(|| Status::new(Code::Internal, "Missing response message."))?;
+
+            if let Some(trailers) = body.trailers().await? {
+                parts.merge(trailers);
+            }
+
+            Ok(Response::from_parts(parts, message, extensions))
+        }
     }
 
     /// Send a client side streaming gRPC request.
@@ -374,5 +437,60 @@ impl<T: fmt::Debug> fmt::Debug for Grpc<T> {
         );
 
         f.finish()
+    }
+}
+
+mod bytes_body {
+    use http::HeaderMap;
+    use http_body::Body;
+    use http_body::SizeHint;
+    use std::pin::Pin;
+    use std::task::Context;
+    use std::task::Poll;
+
+    use crate::Status;
+
+    pub(crate) struct BytesBody {
+        inner: Option<Result<bytes::Bytes, Status>>,
+    }
+
+    impl BytesBody {
+        pub(crate) fn new(inner: Result<bytes::Bytes, Status>) -> Self {
+            BytesBody { inner: Some(inner) }
+        }
+    }
+
+    impl Body for BytesBody {
+        type Data = bytes::Bytes;
+
+        type Error = Status;
+
+        #[inline]
+        fn poll_data(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+            Poll::Ready(self.inner.take())
+        }
+
+        #[inline]
+        fn poll_trailers(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<Option<HeaderMap>, Self::Error>> {
+            Poll::Ready(Ok(None))
+        }
+
+        #[inline]
+        fn is_end_stream(&self) -> bool {
+            self.inner.is_none()
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(match self.inner.as_ref() {
+                Some(Ok(bytes)) => bytes.len() as u64,
+                _ => 0,
+            })
+        }
     }
 }
