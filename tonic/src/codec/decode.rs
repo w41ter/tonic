@@ -107,7 +107,7 @@ impl<T> Streaming<T> {
                     .boxed_unsync(),
                 state: State::ReadHeader,
                 direction,
-                buf: BytesMut::with_capacity(BUFFER_SIZE),
+                buf: BytesMut::new(), //with_capacity(BUFFER_SIZE),
                 trailers: None,
                 decompress_buf: BytesMut::new(),
                 encoding,

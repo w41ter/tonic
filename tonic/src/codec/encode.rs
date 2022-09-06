@@ -58,7 +58,7 @@ where
     T: Encoder<Error = Status>,
     U: Stream<Item = Result<T::Item, Status>>,
 {
-    let mut buf = BytesMut::with_capacity(BUFFER_SIZE);
+    let mut buf = BytesMut::new();//with_capacity(BUFFER_SIZE);
 
     let compression_encoding = if compression_override == SingleMessageCompressionOverride::Disable
     {
